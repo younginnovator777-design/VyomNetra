@@ -3,19 +3,13 @@
  VyomNetra  ::  CORE DETECTION ENGINE  (protected module)
 ================================================================================
 This module contains the complete exoplanet-detection algorithm stack used by
-the VyomNetra dashboard. It is intentionally kept separate from app.py:
-
-  - The UI layer (app.py) only ever calls the public functions below.
-  - No algorithmic parameters, thresholds, or intermediate math are re-derived
-    or duplicated in the UI layer.
-  - This file can be independently compiled to bytecode (.pyc) or packaged as
-    a private wheel for deployment, so the dashboard can ship without the
-    UI ever revealing the underlying source.
-
+the VyomNetra dashboard. It is kept separate from app.py to allow for offline 
+batch processing, and to facilitate unit testing of the core engine without the 
+overhead of the web server.
 Pipeline stages implemented here:
   1. Data acquisition        (TESS SAP_FLUX via lightkurve / MAST, or synthetic)
   2. Detrending               (two-pass median + Savitzky-Golay)
-  3. Periodic transit search  (Box Least Squares, Kovacs et al. 2002)
+  3. Periodic transit search  (Box Least Squares, coarse-to-fine refinement)
   3.5 Mono-transit anomaly search (dual-path engine, isolated-event detector)
   4. Phase folding
   5. Astrophysical parameter extraction (Seager & Mallen-Ornelas 2003)
@@ -84,8 +78,7 @@ def generate_demo_lightcurve(period=0.78884, depth_ppm=20200,
                               duration_hr=1.58, n_points=19440, span_days=27.0):
     """
     Synthesises a light curve reproducing the WASP-19 b system (TIC
-    35516889) — an ultra-short-period, deep-transit hot Jupiter used as
-    the reference validation case for this pipeline. Used for the
+    35516889) — an ultra-short-period, deep-transit hot Jupiter used for the
     built-in Demo Run, and as an offline fallback when live MAST access
     is unavailable. The random seed is fixed internally so the demo is
     fully reproducible.
@@ -101,7 +94,7 @@ def generate_demo_lightcurve(period=0.78884, depth_ppm=20200,
     in_tr = np.abs(phase - 0.5) < (dur_inj / period / 2)
     phase_c = (phase - 0.5) * period
     depth_profile = dep_inj * np.cos(np.pi * phase_c[in_tr] / dur_inj) ** 2
-    flux[in_tr] -= dep_inj - depth_profile
+    flux[in_tr] -= depth_profile
 
     # instrumental ramp systematic
     flux += 0.004 * np.exp(-(time - time[0]) / 4.0)
@@ -178,33 +171,75 @@ def detrend_lightcurve(time, flux, window_fraction=0.1, polyorder=3, n_sigma=3.5
 def run_bls(time, flat_flux, period_min=0.5, period_max=13.0, n_periods=5000):
     """
     Box Least Squares transit search (Kovacs, Zucker & Mazeh 2002) — the
-    same core algorithm used by the TESS/SPOC pipeline. Returns the
-    best-fit transit parameters and full periodogram.
+    same core algorithm used by the TESS/SPOC pipeline. Runs a coarse
+    search over the full period range first, then refines the period
+    with a finer local grid around the coarse best fit.
+
+    Period and mid-transit time from BLS are reliable and are kept
+    as-is. Duration and depth are then independently re-measured from
+    the phase-folded light curve shape (see refine_transit_geometry),
+    rather than taken directly from the BLS box fit. A box template
+    only fits a flat-bottomed transit; for a real transit with smooth
+    ingress/egress, the box-fit duration is frequently over- or
+    under-resolved by the discreteness of the duration grid, and using
+    that same duration to define an in-transit window for a depth
+    measurement compounds the error rather than correcting it. Measuring
+    the geometry directly from the folded profile avoids this.
     """
-    durations = np.array([0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.18,
-                           0.22, 0.25, 0.30, 0.36])
+    coarse_durations = np.geomspace(0.02, min(0.5, period_min * 0.4), 20)
 
     period_grid = np.geomspace(period_min, period_max, n_periods)
     bls = BoxLeastSquares(time, flat_flux, dy=np.full_like(flat_flux, np.nanstd(flat_flux)))
-    result = bls.power(period_grid, durations, objective="snr")
+    result = bls.power(period_grid, coarse_durations, objective="snr")
 
-    best_idx = np.argmax(result.power)
-    best_period = float(result.period[best_idx])
-    best_t0 = float(result.transit_time[best_idx])
-    best_depth = float(result.depth[best_idx])
-    best_duration = float(result.duration[best_idx])
+    coarse_idx = np.argmax(result.power)
+    coarse_period = float(result.period[coarse_idx])
+    coarse_t0 = float(result.transit_time[coarse_idx])
+    coarse_duration = float(result.duration[coarse_idx])
 
     mean_power = np.nanmean(result.power)
     std_power = np.nanstd(result.power)
-    sde = (float(result.power[best_idx]) - mean_power) / (std_power + 1e-12)
+    sde = (float(result.power[coarse_idx]) - mean_power) / (std_power + 1e-12)
+
+    # Refinement: narrow period window around the coarse peak, finer
+    # duration sampling around the coarse duration estimate. This
+    # locks in an accurate period and t0; duration/depth from this
+    # stage are only a starting point for the geometry refinement below.
+    local_span = max(period_grid[coarse_idx] - period_grid[max(coarse_idx - 1, 0)],
+                      period_grid[min(coarse_idx + 1, n_periods - 1)] - period_grid[coarse_idx])
+    p_lo = max(period_min, coarse_period - 8 * local_span)
+    p_hi = min(period_max, coarse_period + 8 * local_span)
+    fine_period_grid = np.linspace(p_lo, p_hi, 400) if p_hi > p_lo else np.array([coarse_period])
+    fine_durations = np.linspace(max(0.005, coarse_duration * 0.4),
+                                  min(coarse_duration * 2.5, p_lo * 0.4 if p_lo > 0 else coarse_duration * 2.5),
+                                  30)
+
+    fine_result = bls.power(fine_period_grid, fine_durations, objective="snr")
+    fine_idx = np.argmax(fine_result.power)
+
+    best_period = float(fine_result.period[fine_idx])
+    best_t0 = float(fine_result.transit_time[fine_idx])
+    box_duration = float(fine_result.duration[fine_idx])
+    box_depth = float(fine_result.depth[fine_idx])
+
+    geometry = refine_transit_geometry(time, flat_flux, best_period, best_t0)
+    if geometry is not None:
+        best_t0 = geometry["t0"]
+        best_duration = geometry["duration"]
+        best_depth = geometry["depth"]
+    else:
+        best_duration = box_duration
+        best_depth = box_depth
 
     phase = ((time - best_t0) % best_period) / best_period
+    phase[phase > 0.5] -= 1.0
     half_dur = best_duration / best_period / 2
-    in_tr = (phase < half_dur) | (phase > 1 - half_dur)
+    in_tr = np.abs(phase) < half_dur
+    out_tr = ~in_tr
 
     n_in = in_tr.sum()
     if n_in > 2:
-        oot_scatter = np.nanstd(flat_flux[~in_tr])
+        oot_scatter = np.nanstd(flat_flux[out_tr])
         snr = best_depth / (oot_scatter / np.sqrt(n_in)) if oot_scatter > 0 else 0.0
     else:
         snr = 0.0
@@ -215,6 +250,80 @@ def run_bls(time, flat_flux, period_min=0.5, period_max=13.0, n_periods=5000):
         "duration_hr": best_duration * 24, "snr": snr, "sde": sde,
         "period_grid": period_grid, "power": np.array(result.power),
     }
+
+
+def refine_transit_geometry(time, flat_flux, period, t0_guess, n_bins=300):
+    """
+    Independently measures transit depth, duration and mid-time from the
+    phase-folded, binned light curve, rather than trusting the BLS box
+    fit's duration grid. This works for any transit profile — box,
+    trapezoid, or limb-darkened — because it operates on the shape of
+    the folded flux itself:
+
+      1. Bin the light curve into n_bins across one full phase cycle.
+      2. Establish an out-of-transit baseline level and scatter from
+         bins away from phase 0.
+      3. Find the contiguous block of bins near phase 0 that sits
+         significantly below that baseline — this is the empirical
+         transit window, sized to whatever the data actually shows
+         rather than snapped to a fixed duration grid.
+      4. Depth is measured from the deepest half of the bins in that
+         window (robust to ingress/egress dilution, since averaging
+         over the full window would understate the true depth for any
+         non-box transit shape).
+      5. t0 is refined as the depth-weighted centroid of the window.
+
+    Returns None if no statistically significant, contiguous dip is
+    resolved near phase 0, so callers can fall back to the BLS box
+    estimate for weak or ambiguous signals.
+    """
+    centres, binned, bin_err, ph_raw, fl_raw = phase_fold(time, flat_flux, period, t0_guess, n_bins=n_bins)
+
+    valid = ~np.isnan(binned)
+    if valid.sum() < 20:
+        return None
+
+    baseline_mask = valid & (np.abs(centres) > 0.15)
+    if baseline_mask.sum() < 10:
+        baseline_mask = valid
+    baseline_level = float(np.nanmedian(binned[baseline_mask]))
+    baseline_scatter = float(np.nanstd(binned[baseline_mask]))
+    if baseline_scatter <= 0:
+        return None
+
+    near_zero = valid & (np.abs(centres) < 0.15)
+    threshold = baseline_level - 2.5 * baseline_scatter
+    below = near_zero & (binned < threshold)
+
+    if below.sum() < 2:
+        return None
+
+    idx = np.where(below)[0]
+    groups = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+    best_group = min(groups, key=lambda g: np.min(np.abs(centres[g])))
+
+    if len(best_group) < 2:
+        return None
+
+    in_bins = binned[best_group]
+    deepest_half = np.sort(in_bins)[:max(1, len(in_bins) // 2)]
+    depth = baseline_level - float(np.nanmean(deepest_half))
+
+    bin_width = centres[1] - centres[0]
+    duration_phase = (centres[best_group[-1]] - centres[best_group[0]]) + bin_width
+    duration_days = duration_phase * period
+
+    weights = np.clip(baseline_level - in_bins, a_min=0, a_max=None)
+    if weights.sum() > 0:
+        t0_shift_phase = float(np.average(centres[best_group], weights=weights))
+    else:
+        t0_shift_phase = float(np.mean(centres[best_group]))
+    refined_t0 = t0_guess + t0_shift_phase * period
+
+    if depth <= 0 or duration_days <= 0:
+        return None
+
+    return {"depth": depth, "duration": duration_days, "t0": refined_t0}
 
 
 # =========================================================================
@@ -279,6 +388,14 @@ def get_stellar_params(tic_id_str):
     Queries the TESS Input Catalog for host-star radius, mass and
     effective temperature. Falls back to solar baseline values if the
     catalogue lookup fails or the target cannot be resolved.
+
+    Caveat: TIC mass estimates are typically derived assuming a
+    main-sequence mass-temperature relation, and can be biased low for
+    stars that have evolved off the main sequence (subgiants, slightly
+    evolved dwarfs). Since the derived semi-major axis depends on mass
+    via Kepler's third law, this is the single largest source of
+    systematic error in a/AU and a/R* for such targets. Manual override
+    is recommended when an independent mass estimate is available.
     """
     try:
         from astroquery.mast import Catalogs
@@ -580,7 +697,7 @@ def plot_diagnostic(time, flux, flat_flux, trend, bls, ph_c, ph_flux, ph_err,
 # highlight what the dual-path engine adds over a standard periodic-only
 # search, for direct display in the dashboard.
 # =========================================================================
-def generate_insights(bls_result, vetting, mono_events, params, cfg):
+def generate_insights(bls_result, vetting, mono_events, params, cfg, stellar_source="catalog"):
     """
     Builds a short list of plain-language findings summarising what this
     run actually discovered, and where the dual-path (BLS + mono-transit)
@@ -618,7 +735,6 @@ def generate_insights(bls_result, vetting, mono_events, params, cfg):
     # 2. Dual-path value-add: mono-transit scan
     if len(mono_events) > 0:
         top = mono_events[0]
-        # is the deepest mono event essentially the same event as the BLS transit, or new?
         insights.append({
             "kind": "positive",
             "text": (f"Independent mono-transit scan flagged {len(mono_events)} isolated dip(s) "
@@ -660,6 +776,20 @@ def generate_insights(bls_result, vetting, mono_events, params, cfg):
                   f"transit geometry (Seager & Mallén-Ornelas 2003), not fitted or assumed.")
     })
 
+    # 5. Stellar mass provenance — flagged because catalog-derived masses
+    # are a known source of systematic error in the semi-major axis via
+    # Kepler's third law, particularly for stars evolved off the main
+    # sequence.
+    if stellar_source == "catalog":
+        insights.append({
+            "kind": "warning",
+            "text": ("Stellar mass was pulled from the TESS Input Catalog rather than supplied "
+                      "manually. Catalog masses assume a main-sequence relation and can be "
+                      "underestimated for evolved stars, which propagates directly into the "
+                      "semi-major axis and equilibrium temperature. Override with an independent "
+                      "mass estimate under Host Star Parameters if one is available.")
+        })
+
     return insights
 
 
@@ -684,6 +814,7 @@ def run_pipeline(time, flux, flux_err, tic_id, config=None, r_star=None,
 
     ph_c, ph_flux, ph_err, ph_raw, fl_raw = phase_fold(time, flat_flux, bls_result["period"], bls_result["t0"])
 
+    stellar_source = "manual" if (r_star is not None and m_star is not None and t_star is not None) else "catalog"
     if r_star is None or m_star is None or t_star is None:
         r_star, m_star, t_star = get_stellar_params(tic_id)
 
@@ -694,12 +825,10 @@ def run_pipeline(time, flux, flux_err, tic_id, config=None, r_star=None,
     fig = plot_diagnostic(time, flux, flat_flux, trend, bls_result, ph_c, ph_flux, ph_err,
                            params, vetting, tic_id, cfg["period_min"], cfg["period_max"])
 
-    insights = generate_insights(bls_result, vetting, mono_events, params, cfg)
+    insights = generate_insights(bls_result, vetting, mono_events, params, cfg, stellar_source=stellar_source)
 
-    # Full-resolution light curve is kept out of the in-memory bundle by
-    # default (it can be tens of thousands of rows and adds nothing the
-    # diagnostic figure doesn't already show) — callers that need it for
-    # export can request it via include_raw_lightcurve=True below.
+    # Raw cadence-by-cadence light curve is bundled here for CSV export
+    # only; the dashboard does not render it as an on-screen table.
     lc_table = pd.DataFrame({
         "time_btjd": time, "raw_flux": flux, "flux_err": flux_err,
         "detrended_flux": flat_flux, "trend_model": trend,
@@ -731,6 +860,7 @@ def run_pipeline(time, flux, flux_err, tic_id, config=None, r_star=None,
         "SecondaryEclipse_pass": vetting["test2_pass"],
         "TransitShape_pass": vetting["test3_pass"],
         "R_star_solar": r_star, "M_star_solar": m_star, "T_star_K": t_star,
+        "Stellar_param_source": stellar_source,
     }])
 
     return {
@@ -738,7 +868,8 @@ def run_pipeline(time, flux, flux_err, tic_id, config=None, r_star=None,
         "mono_events": mono_events, "figure": fig, "insights": insights,
         "lc_table": lc_table, "phase_table": phase_table,
         "mono_table": mono_table, "summary_table": summary_table,
-        "stellar": {"R_star_solar": r_star, "M_star_solar": m_star, "T_star_K": t_star},
+        "stellar": {"R_star_solar": r_star, "M_star_solar": m_star, "T_star_K": t_star,
+                    "source": stellar_source},
         "config": cfg,
     }
 
